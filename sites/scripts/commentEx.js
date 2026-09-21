@@ -26,6 +26,13 @@
         { value: 'Confirmed', emoji: '✅', title: '確認しました' },
         { value: 'Thanks', emoji: '🙏', title: 'ありがとう' }
     ];
+    // OS通知で「既に通知済み」を判定するためlocalStorageに保存するキー
+    const NOTIFIED_MENTIONS_STORAGE_KEY = 'commentExNotifiedMentionIds';
+    const NOTIFIED_REACTIONS_STORAGE_KEY = 'commentExNotifiedReactionIds';
+    // メンション通知(サイト全体)を確認する間隔(ミリ秒)
+    const MENTION_NOTIFY_INTERVAL = 15000;
+
+    let mentionNotifyTimerId;
 
     let pollingTimerId;
     let fetching = false;
@@ -62,6 +69,61 @@
             'padding:2px 8px;font-size:12px;cursor:pointer;}' +
             '.comment-ex-reaction-btn.is-mine{background:#e8f0fe;border-color:#4a89dc;}';
         document.head.appendChild(style);
+    }
+
+    // ブラウザのOS通知の許可をリクエストする(初回のみ)
+    function ensureNotificationPermission() {
+        if (typeof Notification === 'undefined') {
+            return;
+        }
+        if (Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
+    }
+
+    // OS通知を表示する。未許可・未対応ブラウザの場合は何もしない。クリック時にurlがあれば遷移する
+    function showOsNotification(title, body, url) {
+        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+            return;
+        }
+        try {
+            const notification = new Notification(title, { body: body });
+            if (url) {
+                notification.onclick = function () {
+                    window.focus();
+                    location.href = url;
+                    notification.close();
+                };
+            }
+        } catch (e) {
+            console.log('[CommentEx] showOsNotification failed', e);
+        }
+    }
+
+    // 通知済みIDの集合をlocalStorageから読み込む
+    function loadNotifiedIds(storageKey) {
+        try {
+            return new Set(JSON.parse(localStorage.getItem(storageKey) || '[]'));
+        } catch (e) {
+            return new Set();
+        }
+    }
+
+    // 通知済みIDの集合をlocalStorageへ保存する
+    function saveNotifiedIds(storageKey, idSet) {
+        try {
+            localStorage.setItem(storageKey, JSON.stringify(Array.from(idSet)));
+        } catch (e) {
+            // ストレージが使えなくても通知機能自体は継続する
+        }
+    }
+
+    // ユーザーIDから表示名を引く(担当者・管理者ドロップダウンの範囲でのみ解決可能)
+    function userNameOf(userId) {
+        const user = getUserDirectory().find(function (u) {
+            return u.id === userId;
+        });
+        return user ? user.name : ('ユーザー' + userId);
     }
 
     // コメントラッパーのid("CommentNN.wrapper")からコメントIDを取り出す
@@ -116,6 +178,44 @@
                     console.log('[CommentEx] mention apiCreate fail', user, res);
                 }
             });
+        });
+    }
+
+    // サイト全体から自分宛てのメンションを確認し、未通知のものをOS通知する
+    function checkMentionNotifications() {
+        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+            return;
+        }
+        const myUserId = $p.userId();
+        $p.apiGet({
+            id: MENTIONS_SITE_ID,
+            data: { View: { ColumnFilterHash: { Owner: JSON.stringify([String(myUserId)]) } } },
+            done: function (res) {
+                console.log('[CommentEx] checkMentionNotifications response', res);
+                const rows = (res && res.Response && res.Response.Data) || [];
+                const notified = loadNotifiedIds(NOTIFIED_MENTIONS_STORAGE_KEY);
+                let changed = false;
+                rows.forEach(function (row) {
+                    if (row.Creator === myUserId || notified.has(row.ResultId)) {
+                        return;
+                    }
+                    notified.add(row.ResultId);
+                    changed = true;
+                    const excerpt = (row.ClassHash && row.ClassHash.ClassA) || '';
+                    const recordTitle = (row.ClassHash && row.ClassHash.ClassB) || '';
+                    const recordId = row.NumHash && row.NumHash.NumA;
+                    showOsNotification(
+                        userNameOf(row.Creator) + 'さんからメンションされました',
+                        recordTitle ? recordTitle + ': ' + excerpt : excerpt,
+                        recordId ? '/items/' + recordId + '/edit' : undefined);
+                });
+                if (changed) {
+                    saveNotifiedIds(NOTIFIED_MENTIONS_STORAGE_KEY, notified);
+                }
+            },
+            fail: function (res) {
+                console.log('[CommentEx] checkMentionNotifications fail', res);
+            }
         });
     }
 
@@ -257,6 +357,32 @@
         return $bar;
     }
 
+    // このレコードで未通知の他人からのリアクションをOS通知する(自分の分は除く)
+    function notifyNewReactions(rows) {
+        if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+            return;
+        }
+        const myUserId = $p.userId();
+        const notified = loadNotifiedIds(NOTIFIED_REACTIONS_STORAGE_KEY);
+        let changed = false;
+        rows.forEach(function (row) {
+            if (row.Creator === myUserId || notified.has(row.ResultId)) {
+                return;
+            }
+            notified.add(row.ResultId);
+            changed = true;
+            const type = REACTION_TYPES.find(function (t) {
+                return t.value === (row.ClassHash && row.ClassHash.ClassA);
+            });
+            showOsNotification(
+                userNameOf(row.Creator) + 'さんがリアクションしました',
+                (type ? type.emoji + ' ' + type.title : 'リアクション') + ' - ' + ($('#Results_Title').val() || ''));
+        });
+        if (changed) {
+            saveNotifiedIds(NOTIFIED_REACTIONS_STORAGE_KEY, notified);
+        }
+    }
+
     // このレコードの全コメントのリアクション集計を取得し、ボタンの表示を更新する
     function refreshReactions() {
         const $comments = $('#CommentList > .comment');
@@ -273,6 +399,7 @@
             done: function (res) {
                 // 応答は { Response: { Data: [...] } } で、拡張列は NumHash/ClassHash にネストされる
                 const rows = (res && res.Response && res.Response.Data) || [];
+                notifyNewReactions(rows);
                 const byComment = {};
                 rows.forEach(function (row) {
                     const commentId = row.NumHash && row.NumHash.NumB;
@@ -402,6 +529,11 @@
 
     setupMentionRegistration();
     setupReactionButtons();
+
+    // メンション宛先の自分をサイト全体(一覧・編集画面問わず)で継続的に確認しOS通知する
+    ensureNotificationPermission();
+    checkMentionNotifications();
+    mentionNotifyTimerId = setInterval(checkMentionNotifications, MENTION_NOTIFY_INTERVAL);
 
     $p.events.on_editor_load = function () {
         setupMentionAutocomplete();
